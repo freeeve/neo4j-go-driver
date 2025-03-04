@@ -108,12 +108,22 @@ func (p *Pool) Close(ctx context.Context) {
 	p.queueMut.Unlock()
 	// Go through each server and close all connections to it
 	p.serversMut.Lock()
-	for n, s := range p.servers {
-		s.closeAll(ctx, p.closeConnection)
-		delete(p.servers, n)
+	pendingConnections := 0
+	for _, s := range p.servers {
+		s.startClosing(ctx, p.closeConnection)
+		pendingConnections += s.size()
 	}
 	p.serversMut.Unlock()
-	p.log.Infof(log.Pool, p.logId, "Closed")
+	if pendingConnections == 0 {
+		p.log.Infof(log.Pool, p.logId, "Closed")
+	} else {
+		p.log.Warnf(
+			log.Pool,
+			p.logId,
+			"Called close with %d in-flight connections (will be closed when work is done).",
+			pendingConnections,
+		)
+	}
 }
 
 // For testing
@@ -194,8 +204,8 @@ func (p *Pool) Borrow(
 	auth *idb.ReAuthToken,
 ) (idb.Connection, error) {
 	for {
-		if p.closed {
-			return nil, &errorutil.PoolClosed{}
+		if err := p.checkClosed(); err != nil {
+			return nil, err
 		}
 		serverNames := getServerNames()
 		if len(serverNames) == 0 {
@@ -294,6 +304,10 @@ func (p *Pool) tryBorrow(
 	var unlock = new(sync.Once)
 	defer unlock.Do(p.serversMut.Unlock)
 
+	if err := p.checkClosed(); err != nil {
+		return nil, err
+	}
+
 	srv := p.servers[serverName]
 	for {
 		if srv != nil {
@@ -351,6 +365,13 @@ func (p *Pool) tryBorrow(
 	return c, nil
 }
 
+func (p *Pool) checkClosed() error {
+	if p.closed {
+		return &errorutil.PoolClosed{}
+	}
+	return nil
+}
+
 func (p *Pool) unreg(ctx context.Context, serverName string, c idb.Connection, now time.Time) {
 	p.serversMut.Lock()
 	defer p.serversMut.Unlock()
@@ -396,13 +417,19 @@ func (p *Pool) closeConnection(ctx context.Context, c idb.Connection) {
 func (p *Pool) Return(ctx context.Context, c idb.Connection) {
 	if p.closed {
 		p.log.Warnf(log.Pool, p.logId, "Trying to return connection to closed pool")
-		return
 	}
 
 	// Get the name of the server that the connection belongs to.
 	serverName := c.ServerName()
 	isAlive := c.IsAlive()
-	p.log.Debugf(log.Pool, p.logId, "Returning connection to %s {alive:%t}", serverName, isAlive)
+	p.log.Debugf(
+		log.Pool,
+		p.logId,
+		"Returning connection %s to %s {alive:%t}",
+		c.ConnId(),
+		serverName,
+		isAlive,
+	)
 
 	// If the connection is dead, remove all other idle connections on the same server that older
 	// or of the same age as the dead connection, otherwise perform normal cleanup of old connections
