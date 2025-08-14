@@ -26,16 +26,14 @@ import (
 // ManagedTransaction represents a transaction managed by the driver and operated on by the user, via transaction functions
 type ManagedTransaction interface {
 	// Run executes a statement on this transaction and returns a result
-	Run(ctx context.Context, cypher string, params map[string]any) (ResultWithContext, error)
-
-	legacy() Transaction
+	Run(ctx context.Context, cypher string, params map[string]any) (Result, error)
 }
 
 // ExplicitTransaction represents a transaction in the Neo4j database
 type ExplicitTransaction interface {
 	// Run executes a statement on this transaction and returns a result
 	// Contexts terminating too early negatively affect connection pooling and degrade the driver performance.
-	Run(ctx context.Context, cypher string, params map[string]any) (ResultWithContext, error)
+	Run(ctx context.Context, cypher string, params map[string]any) (Result, error)
 	// Commit commits the transaction
 	// Contexts terminating too early negatively affect connection pooling and degrade the driver performance.
 	Commit(ctx context.Context) error
@@ -46,10 +44,6 @@ type ExplicitTransaction interface {
 	// and closes all resources associated with this transaction
 	// Contexts terminating too early negatively affect connection pooling and degrade the driver performance.
 	Close(ctx context.Context) error
-
-	// legacy returns the non-cancelling, legacy variant of this ExplicitTransaction type
-	// This is used so that legacy transaction functions can delegate work to their newer, context-aware variants
-	legacy() Transaction
 }
 
 type transactionState struct {
@@ -73,7 +67,7 @@ type explicitTransaction struct {
 	onClosed  func()
 }
 
-func (tx *explicitTransaction) Run(ctx context.Context, cypher string, params map[string]any) (ResultWithContext, error) {
+func (tx *explicitTransaction) Run(ctx context.Context, cypher string, params map[string]any) (Result, error) {
 	if tx.conn == nil {
 		return nil, transactionAlreadyCompletedError()
 	}
@@ -83,7 +77,7 @@ func (tx *explicitTransaction) Run(ctx context.Context, cypher string, params ma
 		return nil, errorutil.WrapError(tx.txState.err)
 	}
 	// no result consumption hook here since bookmarks are sent after commit, not after pulling results
-	result := newResultWithContext(tx.conn, stream, cypher, params, tx.txState, nil)
+	result := newResult(tx.conn, stream, cypher, params, tx.txState, nil)
 	tx.txState.resultErrorHandlers = append(tx.txState.resultErrorHandlers, result.errorHandler)
 	return result, nil
 }
@@ -125,12 +119,6 @@ func (tx *explicitTransaction) Rollback(ctx context.Context) error {
 	return errorutil.WrapError(tx.txState.err)
 }
 
-func (tx *explicitTransaction) legacy() Transaction {
-	return &transaction{
-		delegate: tx,
-	}
-}
-
 // ManagedTransaction implementation used as parameter to transactional functions
 type managedTransaction struct {
 	conn      db.Connection
@@ -139,42 +127,20 @@ type managedTransaction struct {
 	txState   *transactionState
 }
 
-func (tx *managedTransaction) Run(ctx context.Context, cypher string, params map[string]any) (ResultWithContext, error) {
+func (tx *managedTransaction) Run(ctx context.Context, cypher string, params map[string]any) (Result, error) {
 	stream, err := tx.conn.RunTx(ctx, tx.txHandle, db.Command{Cypher: cypher, Params: params, FetchSize: tx.fetchSize})
 	if err != nil {
 		return nil, errorutil.WrapError(err)
 	}
 	// no result consumption hook here since bookmarks are sent after commit, not after pulling results
-	return newResultWithContext(tx.conn, stream, cypher, params, tx.txState, nil), nil
-}
-
-// legacy interop only - remove in 6.0
-func (tx *managedTransaction) Commit(context.Context) error {
-	return &UsageError{Message: "Commit not allowed on retryable transaction"}
-}
-
-// legacy interop only - remove in 6.0
-func (tx *managedTransaction) Rollback(context.Context) error {
-	return &UsageError{Message: "Rollback not allowed on retryable transaction"}
-}
-
-// legacy interop only - remove in 6.0
-func (tx *managedTransaction) Close(context.Context) error {
-	return &UsageError{Message: "Close not allowed on retryable transaction"}
-}
-
-// legacy interop only - remove in 6.0
-func (tx *managedTransaction) legacy() Transaction {
-	return &transaction{
-		delegate: tx,
-	}
+	return newResult(tx.conn, stream, cypher, params, tx.txState, nil), nil
 }
 
 // Represents an auto commit transaction.
 // Does not implement the ExplicitTransaction nor the ManagedTransaction interface.
 type autocommitTransaction struct {
 	conn     db.Connection
-	res      ResultWithContext
+	res      Result
 	closed   bool
 	onClosed func()
 }

@@ -23,7 +23,7 @@ import (
 	"fmt"
 )
 
-var myDriver DriverWithContext
+var myDriver Driver
 var ctx = context.Background()
 
 func ExampleExecuteQuery() {
@@ -103,8 +103,8 @@ func ExampleExecuteQuery_defaultBookmarkManagerExplicitReuse() {
 	fmt.Println(count)
 }
 
-func ExampleDriverWithContext_verifyAuthentication() {
-	driver, err := NewDriverWithContext(getUrl(), NoAuth())
+func ExampleDriver_verifyAuthentication() {
+	driver, err := NewDriver(getUrl(), NoAuth())
 	handleError(err)
 	someToken := BasicAuth("neo4j", "password", "")
 	// verify `someToken` is valid
@@ -121,8 +121,8 @@ func ExampleDriverWithContext_verifyAuthentication() {
 	handleError(err)
 }
 
-func ExampleDriverWithContext_verifyAuthenticationDriverLevel() {
-	driver, err := NewDriverWithContext(getUrl(), NoAuth())
+func ExampleDriver_verifyAuthenticationDriverLevel() {
+	driver, err := NewDriver(getUrl(), NoAuth())
 	handleError(err)
 	// verify `NoAuth()` configured at driver creation is valid
 	err = driver.VerifyAuthentication(context.Background(), nil)

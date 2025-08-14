@@ -20,12 +20,14 @@ package neo4j
 import (
 	"context"
 	"fmt"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/db"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/homedb"
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/racing"
 	"math"
 	"time"
 
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/db"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/homedb"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/racing"
+
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/config"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/collections"
 	idb "github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/db"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/internal/errorutil"
@@ -35,26 +37,17 @@ import (
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/notifications"
 )
 
-// TransactionWork represents a unit of work that will be executed against the provided
-// transaction
-// ManagedTransactionWork is created via the context-aware driver returned
-// by NewDriverWithContext.
-//
-// Deprecated: use ManagedTransactionWork instead. TransactionWork will be removed in 6.0.
-type TransactionWork func(tx Transaction) (any, error)
-
 // ManagedTransactionWork represents a unit of work that will be executed against the provided
 // transaction
 type ManagedTransactionWork func(tx ManagedTransaction) (any, error)
 
-// SessionWithContext represents a logical connection (which is not tied to a physical connection)
+// Session represents a logical connection (which is not tied to a physical connection)
 // to the server
-type SessionWithContext interface {
+type Session interface {
 	// LastBookmarks returns the bookmark received following the last successfully completed transaction.
 	// If no bookmark was received or if this transaction was rolled back, the initial set of bookmarks will be
 	// returned.
 	LastBookmarks() Bookmarks
-	lastBookmark() string
 	// BeginTransaction starts a new explicit transaction on this session
 	// Contexts terminating too early negatively affect connection pooling and degrade the driver performance.
 	BeginTransaction(ctx context.Context, configurers ...func(*TransactionConfig)) (ExplicitTransaction, error)
@@ -68,16 +61,22 @@ type SessionWithContext interface {
 	ExecuteWrite(ctx context.Context, work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error)
 	// Run executes an auto-commit statement and returns a result
 	// Contexts terminating too early negatively affect connection pooling and degrade the driver performance.
-	Run(ctx context.Context, cypher string, params map[string]any, configurers ...func(*TransactionConfig)) (ResultWithContext, error)
+	Run(ctx context.Context, cypher string, params map[string]any, configurers ...func(*TransactionConfig)) (Result, error)
 	// Close closes any open resources and marks this session as unusable
 	// Contexts terminating too early negatively affect connection pooling and degrade the driver performance.
 	Close(ctx context.Context) error
 	executeQueryRead(ctx context.Context, work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error)
 	executeQueryWrite(ctx context.Context, work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error)
-	legacy() Session
 	getServerInfo(ctx context.Context) (ServerInfo, error)
 	verifyAuthentication(ctx context.Context) error
 }
+
+// SessionWithContext is an alias for Session to maintain backward compatibility
+// for users who migrated from v5 to v6 using the WithContext APIs.
+// In v6, Session is the primary interface and is context-aware.
+//
+// Deprecated: please use Session instead. This alias will be removed in 7.0.
+type SessionWithContext = Session
 
 // SessionConfig is used to configure a new session, its zero value uses safe defaults.
 type SessionConfig struct {
@@ -117,7 +116,7 @@ type SessionConfig struct {
 	//		This ensures that the database name remains consistent within the given session. For instance, if the user's
 	//		home database name is 'movies' and the server supplies it to the driver upon database name fetching for the
 	//		session, all queries within that session are executed with the explicit database name 'movies' supplied.
-	//		Any change to the user’s home database is reflected only in sessions created after such change takes effect.
+	//		Any change to the user's home database is reflected only in sessions created after such change takes effect.
 	//		This behavior requires additional network communication.
 	//		In clustered environments, it is strongly recommended to avoid a single point of failure.
 	//		For instance, by ensuring that the connection URI resolves to multiple endpoints.
@@ -138,7 +137,7 @@ type SessionConfig struct {
 	// Logging target the session will send its Bolt message traces
 	//
 	// Possible to use custom logger (implement log.BoltLogger interface) or
-	// use neo4j.ConsoleBoltLogger.
+	// use log.BoltToConsole.
 	BoltLogger log.BoltLogger
 	// ImpersonatedUser sets the Neo4j user that the session will be acting as.
 	// If not set, the user configured for the driver will be used.
@@ -201,8 +200,8 @@ type sessionPool interface {
 	CleanUp(ctx context.Context)
 }
 
-type sessionWithContext struct {
-	driverConfig            *Config
+type session struct {
+	driverConfig            *config.Config
 	defaultMode             idb.AccessMode
 	bookmarks               *sessionBookmarks
 	resolveHomeDb           bool
@@ -223,16 +222,16 @@ type sessionWithContext struct {
 	closed                  bool
 }
 
-func newSessionWithContext(
+func newSession(
 	ctx context.Context,
-	config *Config,
+	config *config.Config,
 	sessConfig SessionConfig,
 	router sessionRouter,
 	pool sessionPool,
 	cache *homedb.Cache,
 	logger log.Logger,
 	token *idb.ReAuthToken,
-) *sessionWithContext {
+) *session {
 	logId := log.NewId()
 	logger.Debugf(log.Session, logId, "Created")
 
@@ -253,7 +252,7 @@ func newSessionWithContext(
 		logger.Debugf(log.Session, logId, "No home database guess found in cache for provided user")
 	}
 
-	session := &sessionWithContext{
+	session := &session{
 		driverConfig:  config,
 		router:        router,
 		pool:          pool,
@@ -276,24 +275,7 @@ func newSessionWithContext(
 	return session
 }
 
-func (s *sessionWithContext) lastBookmark() string {
-	// Pick up bookmark from pending auto-commit if there is a bookmark on it
-	// Note: the bookmark manager should not be notified here because:
-	//  - the results of the autocommit transaction may have not been consumed
-	// 	yet, in which case, the underlying connection may have an outdated
-	//	cached bookmark value
-	//  - moreover, the bookmark manager may already hold newer bookmarks
-	// 	because other sessions for the same DB have completed some work in
-	//	parallel
-	if s.autocommitTx != nil {
-		s.retrieveSessionBookmarks(s.autocommitTx.conn)
-	}
-
-	// Report bookmark from previously closed connection or from initial set
-	return s.bookmarks.lastBookmark()
-}
-
-func (s *sessionWithContext) LastBookmarks() Bookmarks {
+func (s *session) LastBookmarks() Bookmarks {
 	// Pick up bookmark from pending auto-commit if there is a bookmark on it
 	// Note: the bookmark manager should not be notified here because:
 	//  - the results of the autocommit transaction may have not been consumed
@@ -310,7 +292,7 @@ func (s *sessionWithContext) LastBookmarks() Bookmarks {
 	return s.bookmarks.currentBookmarks()
 }
 
-func (s *sessionWithContext) BeginTransaction(ctx context.Context, configurers ...func(*TransactionConfig)) (ExplicitTransaction, error) {
+func (s *session) BeginTransaction(ctx context.Context, configurers ...func(*TransactionConfig)) (ExplicitTransaction, error) {
 
 	if s.closed {
 		err := &UsageError{Message: "Operation attempted on a closed session"}
@@ -399,31 +381,31 @@ func (s *sessionWithContext) BeginTransaction(ctx context.Context, configurers .
 	return s.explicitTx, nil
 }
 
-func (s *sessionWithContext) ExecuteRead(ctx context.Context,
+func (s *session) ExecuteRead(ctx context.Context,
 	work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error) {
 
 	return s.runRetriable(ctx, idb.ReadMode, work, true, telemetry.ManagedTransaction, configurers...)
 }
 
-func (s *sessionWithContext) ExecuteWrite(ctx context.Context,
+func (s *session) ExecuteWrite(ctx context.Context,
 	work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error) {
 
 	return s.runRetriable(ctx, idb.WriteMode, work, true, telemetry.ManagedTransaction, configurers...)
 }
 
-func (s *sessionWithContext) executeQueryRead(ctx context.Context,
+func (s *session) executeQueryRead(ctx context.Context,
 	work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error) {
 
 	return s.runRetriable(ctx, idb.ReadMode, work, false, telemetry.ExecuteQuery, configurers...)
 }
 
-func (s *sessionWithContext) executeQueryWrite(ctx context.Context,
+func (s *session) executeQueryWrite(ctx context.Context,
 	work ManagedTransactionWork, configurers ...func(*TransactionConfig)) (any, error) {
 
 	return s.runRetriable(ctx, idb.WriteMode, work, false, telemetry.ExecuteQuery, configurers...)
 }
 
-func (s *sessionWithContext) runRetriable(
+func (s *session) runRetriable(
 	ctx context.Context,
 	mode idb.AccessMode,
 	work ManagedTransactionWork,
@@ -476,7 +458,7 @@ func (s *sessionWithContext) runRetriable(
 	return nil, err
 }
 
-func (s *sessionWithContext) executeTransactionFunction(
+func (s *session) executeTransactionFunction(
 	ctx context.Context,
 	mode idb.AccessMode,
 	config TransactionConfig,
@@ -551,7 +533,7 @@ func (s *sessionWithContext) executeTransactionFunction(
 	return true, x
 }
 
-func (s *sessionWithContext) getOrUpdateServers(
+func (s *session) getOrUpdateServers(
 	ctx context.Context,
 	mode idb.AccessMode,
 	isHomeDbGuess bool,
@@ -572,7 +554,7 @@ func (s *sessionWithContext) getOrUpdateServers(
 	}
 }
 
-func (s *sessionWithContext) getServers(mode idb.AccessMode) func() []string {
+func (s *session) getServers(mode idb.AccessMode) func() []string {
 	return func() []string {
 		if mode == idb.ReadMode {
 			return s.router.Readers(s.config.DatabaseName)
@@ -582,7 +564,7 @@ func (s *sessionWithContext) getServers(mode idb.AccessMode) func() []string {
 	}
 }
 
-func (s *sessionWithContext) getConnection(ctx context.Context, mode idb.AccessMode, livenessCheckTimeout time.Duration) (idb.Connection, error) {
+func (s *session) getConnection(ctx context.Context, mode idb.AccessMode, livenessCheckTimeout time.Duration) (idb.Connection, error) {
 	ctx, cancel := s.applyConnectionTimeout(ctx)
 	if cancel != nil {
 		defer cancel()
@@ -634,7 +616,7 @@ func (s *sessionWithContext) getConnection(ctx context.Context, mode idb.AccessM
 }
 
 // applyConnectionTimeout sets a timeout on the context if configured.
-func (s *sessionWithContext) applyConnectionTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+func (s *session) applyConnectionTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	timeout := s.driverConfig.ConnectionAcquisitionTimeout
 	if timeout > 0 {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -650,7 +632,7 @@ func (s *sessionWithContext) applyConnectionTimeout(ctx context.Context) (contex
 
 // getServerList resolves the server list based on the session configuration.
 // It returns a list of servers, a boolean indicating whether the home database guess was used, and an error if resolution fails.
-func (s *sessionWithContext) getServerList(ctx context.Context, mode idb.AccessMode) ([]string, bool, error) {
+func (s *session) getServerList(ctx context.Context, mode idb.AccessMode) ([]string, bool, error) {
 	if !s.resolveHomeDb {
 		serverList, err := s.getOrUpdateServers(ctx, mode, false, nil)
 		return serverList, false, err
@@ -675,7 +657,7 @@ func (s *sessionWithContext) getServerList(ctx context.Context, mode idb.AccessM
 }
 
 // borrowConnection requests a connection from the pool using the provided `serverList`.
-func (s *sessionWithContext) borrowConnection(
+func (s *session) borrowConnection(
 	ctx context.Context,
 	serverList []string,
 	livenessCheckTimeout time.Duration,
@@ -691,7 +673,7 @@ func (s *sessionWithContext) borrowConnection(
 }
 
 // selectDatabase ensures the correct database is selected on the connection.
-func (s *sessionWithContext) selectDatabase(ctx context.Context, conn idb.Connection) error {
+func (s *session) selectDatabase(ctx context.Context, conn idb.Connection) error {
 	dbSelector, ok := conn.(idb.DatabaseSelector)
 	if !ok {
 		err := &db.FeatureNotSupportedError{
@@ -703,22 +685,22 @@ func (s *sessionWithContext) selectDatabase(ctx context.Context, conn idb.Connec
 	return nil
 }
 
-func (s *sessionWithContext) retrieveBookmarks(ctx context.Context, conn idb.Connection, sentBookmarks Bookmarks) error {
+func (s *session) retrieveBookmarks(ctx context.Context, conn idb.Connection, sentBookmarks Bookmarks) error {
 	if conn == nil {
 		return nil
 	}
 	return s.bookmarks.replaceBookmarks(ctx, sentBookmarks, conn.Bookmark())
 }
 
-func (s *sessionWithContext) retrieveSessionBookmarks(conn idb.Connection) {
+func (s *session) retrieveSessionBookmarks(conn idb.Connection) {
 	if conn == nil {
 		return
 	}
 	s.bookmarks.replaceSessionBookmarks(conn.Bookmark())
 }
 
-func (s *sessionWithContext) Run(ctx context.Context,
-	cypher string, params map[string]any, configurers ...func(*TransactionConfig)) (ResultWithContext, error) {
+func (s *session) Run(ctx context.Context,
+	cypher string, params map[string]any, configurers ...func(*TransactionConfig)) (Result, error) {
 
 	if s.closed {
 		err := &UsageError{Message: "Operation attempted on a closed session"}
@@ -785,7 +767,7 @@ func (s *sessionWithContext) Run(ctx context.Context,
 
 	s.autocommitTx = &autocommitTransaction{
 		conn: conn,
-		res: newResultWithContext(conn, stream, cypher, params, &transactionState{}, func() {
+		res: newResult(conn, stream, cypher, params, &transactionState{}, func() {
 			if err := s.retrieveBookmarks(ctx, conn, runBookmarks); err != nil {
 				s.log.Warnf(log.Session, s.logId, "could not retrieve bookmarks after result consumption: %s\n"+
 					"the result of the initiating auto-commit transaction may not be visible to subsequent operations", err.Error())
@@ -800,7 +782,7 @@ func (s *sessionWithContext) Run(ctx context.Context,
 	return s.autocommitTx.res, nil
 }
 
-func (s *sessionWithContext) Close(ctx context.Context) error {
+func (s *session) Close(ctx context.Context) error {
 	if s.closed {
 		// Safeguard against closing more than once
 		return nil
@@ -832,11 +814,7 @@ func (s *sessionWithContext) Close(ctx context.Context) error {
 	return txErr
 }
 
-func (s *sessionWithContext) legacy() Session {
-	return &session{delegate: s}
-}
-
-func (s *sessionWithContext) getServerInfo(ctx context.Context) (ServerInfo, error) {
+func (s *session) getServerInfo(ctx context.Context) (ServerInfo, error) {
 	if err := s.resolveHomeDatabase(ctx); err != nil {
 		return nil, errorutil.WrapError(err)
 	}
@@ -862,7 +840,7 @@ func (s *sessionWithContext) getServerInfo(ctx context.Context) (ServerInfo, err
 	}, nil
 }
 
-func (s *sessionWithContext) verifyAuthentication(ctx context.Context) error {
+func (s *session) verifyAuthentication(ctx context.Context) error {
 	_, err := s.getOrUpdateServers(ctx, idb.ReadMode, false, nil)
 	if err != nil {
 		return errorutil.WrapError(err)
@@ -881,7 +859,7 @@ func (s *sessionWithContext) verifyAuthentication(ctx context.Context) error {
 	return nil
 }
 
-func (s *sessionWithContext) resolveHomeDatabase(ctx context.Context) error {
+func (s *session) resolveHomeDatabase(ctx context.Context) error {
 	if !s.resolveHomeDb {
 		return nil
 	}
@@ -903,7 +881,7 @@ func (s *sessionWithContext) resolveHomeDatabase(ctx context.Context) error {
 	return nil
 }
 
-func (s *sessionWithContext) pinHomeDatabase(ctx context.Context, database string) {
+func (s *session) pinHomeDatabase(ctx context.Context, database string) {
 	if !s.resolveHomeDb {
 		return
 	}
@@ -921,7 +899,7 @@ func (s *sessionWithContext) pinHomeDatabase(ctx context.Context, database strin
 	s.resolveHomeDb = false
 }
 
-func (s *sessionWithContext) getBookmarks(ctx context.Context) (Bookmarks, error) {
+func (s *session) getBookmarks(ctx context.Context) (Bookmarks, error) {
 	bookmarks, err := s.bookmarks.getBookmarks(ctx)
 	if err != nil {
 		return nil, err
@@ -931,46 +909,40 @@ func (s *sessionWithContext) getBookmarks(ctx context.Context) (Bookmarks, error
 	return result.Values(), nil
 }
 
-type erroredSessionWithContext struct {
+type erroredSession struct {
 	err error
 }
 
-func (s *erroredSessionWithContext) LastBookmarks() Bookmarks {
+func (s *erroredSession) LastBookmarks() Bookmarks {
 	return nil
 }
 
-func (s *erroredSessionWithContext) lastBookmark() string {
-	return ""
-}
-func (s *erroredSessionWithContext) BeginTransaction(context.Context, ...func(*TransactionConfig)) (ExplicitTransaction, error) {
+func (s *erroredSession) BeginTransaction(context.Context, ...func(*TransactionConfig)) (ExplicitTransaction, error) {
 	return nil, s.err
 }
-func (s *erroredSessionWithContext) ExecuteRead(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
+func (s *erroredSession) ExecuteRead(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
 	return nil, s.err
 }
-func (s *erroredSessionWithContext) ExecuteWrite(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
+func (s *erroredSession) ExecuteWrite(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
 	return nil, s.err
 }
-func (s *erroredSessionWithContext) executeQueryRead(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
+func (s *erroredSession) executeQueryRead(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
 	return nil, s.err
 }
-func (s *erroredSessionWithContext) executeQueryWrite(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
+func (s *erroredSession) executeQueryWrite(context.Context, ManagedTransactionWork, ...func(*TransactionConfig)) (any, error) {
 	return nil, s.err
 }
-func (s *erroredSessionWithContext) Run(context.Context, string, map[string]any, ...func(*TransactionConfig)) (ResultWithContext, error) {
+func (s *erroredSession) Run(context.Context, string, map[string]any, ...func(*TransactionConfig)) (Result, error) {
 	return nil, s.err
 }
-func (s *erroredSessionWithContext) Close(context.Context) error {
+func (s *erroredSession) Close(context.Context) error {
 	return s.err
 }
-func (s *erroredSessionWithContext) legacy() Session {
-	return &erroredSession{err: s.err}
-}
-func (s *erroredSessionWithContext) getServerInfo(context.Context) (ServerInfo, error) {
+func (s *erroredSession) getServerInfo(context.Context) (ServerInfo, error) {
 	return nil, s.err
 }
 
-func (s *erroredSessionWithContext) verifyAuthentication(context.Context) error {
+func (s *erroredSession) verifyAuthentication(context.Context) error {
 	return s.err
 }
 
