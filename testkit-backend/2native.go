@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j/dbtype"
+	"github.com/neo4j/neo4j-go-driver/v6/neo4j/dbtype"
 )
 
 // Converts received proxied "cypher" types to Go native types.
